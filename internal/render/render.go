@@ -67,6 +67,42 @@ func (r *Renderer) SetSource(src *Image) {
 	}
 }
 
+// UpdateRegion replaces part of the lens source image with fresh pixels
+// (img placed at x, y). The dimmed/blurred background is left untouched.
+func (r *Renderer) UpdateRegion(img *Image, x, y int) {
+	for j := 0; j < img.H; j++ {
+		yy := y + j
+		if yy < 0 || yy >= r.src.H {
+			continue
+		}
+		for i := 0; i < img.W; i++ {
+			xx := x + i
+			if xx < 0 || xx >= r.src.W {
+				continue
+			}
+			copy(r.src.Pix[yy*r.src.Stride+xx*4:yy*r.src.Stride+xx*4+4], img.Pix[j*img.Stride+i*4:j*img.Stride+i*4+4])
+		}
+	}
+}
+
+// DrawHole renders the background with a fully transparent circle where the
+// lens is, so that the screen underneath can be captured without the lens.
+// dst is expected to be premultiplied ARGB.
+func (r *Renderer) DrawHole(dst *Image, l Lens) {
+	for y := 0; y < dst.H; y++ {
+		copy(dst.Pix[y*dst.Stride:y*dst.Stride+dst.W*4], r.bg.Pix[y*r.bg.Stride:y*r.bg.Stride+dst.W*4])
+	}
+	rad := l.Radius + 1
+	for y := int(math.Max(0, l.Y-rad)); y <= int(math.Min(float64(dst.H-1), l.Y+rad)); y++ {
+		for x := int(math.Max(0, l.X-rad)); x <= int(math.Min(float64(dst.W-1), l.X+rad)); x++ {
+			if math.Hypot(float64(x)+0.5-l.X, float64(y)+0.5-l.Y) <= rad {
+				o := y*dst.Stride + x*4
+				dst.Pix[o], dst.Pix[o+1], dst.Pix[o+2], dst.Pix[o+3] = 0, 0, 0, 0
+			}
+		}
+	}
+}
+
 // Draw renders one frame into dst, which must have the source's dimensions.
 func (r *Renderer) Draw(dst *Image, l Lens) {
 	for y := 0; y < dst.H; y++ {

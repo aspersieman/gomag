@@ -66,3 +66,25 @@ func TestLensAtEdgeDoesNotPanic(t *testing.T) {
 		r.Draw(dst, Lens{X: p[0], Y: p[1], Radius: 30, Zoom: 8})
 	}
 }
+
+func TestHoleAndUpdateRegion(t *testing.T) {
+	src := checker(100, 100)
+	r := New(src, Options{Dim: 0.5})
+	dst := NewImage(100, 100)
+	r.DrawHole(dst, Lens{X: 50, Y: 50, Radius: 20, Zoom: 2})
+	if dst.Pix[50*dst.Stride+50*4+3] != 0 {
+		t.Fatal("centre should be transparent")
+	}
+	if dst.Pix[5*dst.Stride+5*4+3] != 255 {
+		t.Fatal("outside should be opaque")
+	}
+	patch := NewImage(4, 4)
+	for i := range patch.Pix {
+		patch.Pix[i] = 77
+	}
+	r.UpdateRegion(patch, 48, 48)
+	if px(src, 49, 49) != 77 {
+		t.Fatal("region not updated")
+	}
+	r.UpdateRegion(patch, 98, 98) // partially out of bounds must not panic
+}
