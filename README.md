@@ -1,0 +1,2 @@
+# gomag
+Wayland desktop magnifier
