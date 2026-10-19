@@ -50,7 +50,7 @@ By default gomag magnifies a snapshot taken at start-up. With `-live` it keeps r
 magnified area (`-fps`, default 10). The overlay would otherwise capture itself, so for each
 refresh only the lens is made transparent for an instant while just the small area under it is
 captured; the dimmed background stays up and is *not* refreshed (it remains the start-up
-snapshot). A faint flicker of the lens can remain on slower machines; lower `-fps` to reduce it.
+snapshot). The lens is hidden only for about one compositor frame per refresh (the capture buffer is reused and the hole is committed together with the copy request). Some flicker can remain because wlroots cannot exclude a layer from a capture; lower `-fps` to reduce it, or omit `-live` for a static, flicker-free lens.
 
 ## Test
 
