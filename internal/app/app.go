@@ -34,6 +34,21 @@ type output struct {
 	name string
 }
 
+// monitor is the overlay and capture state of a single output.
+type monitor struct {
+	out            *output
+	surface, layer uint32
+	lw, lh, scale  int
+	configured     bool
+	pending        bool
+	src            *render.Image
+	renderer       *render.Renderer
+	bufs           []*shmBuffer
+	px, py         float64
+	hasPtr         bool
+	capturing      bool
+}
+
 // App is the magnifier client.
 type App struct {
 	cfg      Config
@@ -45,22 +60,10 @@ type App struct {
 	outputs                                                 []*output
 	globals                                                 map[string]struct{ name, version uint32 }
 
-	surface, layer uint32
-	lw, lh         int // logical size
-	scale          int
-	configured     bool
-	pending        bool // frame needs redraw
-
-	src      *render.Image
-	renderer *render.Renderer
-	bufs     []*shmBuffer
-
-	px, py   float64 // pointer, logical
-	havePtr  bool
+	monitors []*monitor
+	active   *monitor // monitor currently containing the pointer
 	zoom     float64
 	quit     bool
-	capture  bool // capture in flight
-	hidden   bool // transparent buffer shown for capture
 	pointer  uint32
 	keyboard uint32
 }
@@ -97,19 +100,22 @@ func (a *App) run(stop <-chan struct{}) error {
 	if err := a.roundtrip(stop); err != nil { // output names etc.
 		return err
 	}
-	out, err := a.pickOutput()
+	outs, err := a.pickOutputs()
 	if err != nil {
 		return err
 	}
 
-	// Initial capture happens before our overlay exists, so it is clean.
-	if err := a.captureSync(out, stop); err != nil {
-		return err
+	// Initial captures happen before any overlay exists, so they are clean.
+	for _, o := range outs {
+		m := &monitor{out: o}
+		if err := a.captureSync(m, stop); err != nil {
+			return err
+		}
+		m.renderer = render.New(m.src, render.Options{Dim: a.cfg.Dim, Blur: a.cfg.Blur, Border: a.cfg.Border})
+		a.monitors = append(a.monitors, m)
 	}
-	a.renderer = render.New(a.src, render.Options{Dim: a.cfg.Dim, Blur: a.cfg.Blur, Border: a.cfg.Border})
-
-	if err := a.createSurface(out); err != nil {
-		return err
+	for _, m := range a.monitors {
+		a.createSurface(m)
 	}
 
 	interval := time.Hour
@@ -133,13 +139,15 @@ func (a *App) run(stop <-chan struct{}) error {
 			}
 			a.dispatch(m)
 		case <-tick.C:
-			if a.cfg.Live {
-				a.startLiveCapture(out)
+			if a.cfg.Live && a.active != nil {
+				a.startLiveCapture(a.active)
 			}
 		case <-stop:
 			a.quit = true
 		}
-		a.redraw()
+		for _, m := range a.monitors {
+			a.redraw(m)
+		}
 	}
 	return nil
 }
@@ -264,16 +272,16 @@ func (a *App) bindGlobals() error {
 	return nil
 }
 
-func (a *App) pickOutput() (*output, error) {
+func (a *App) pickOutputs() ([]*output, error) {
 	if len(a.outputs) == 0 {
 		return nil, errors.New("no outputs found")
 	}
 	if a.cfg.Output == "" {
-		return a.outputs[0], nil
+		return a.outputs, nil
 	}
 	for _, o := range a.outputs {
 		if o.name == a.cfg.Output {
-			return o, nil
+			return []*output{o}, nil
 		}
 	}
 	return nil, fmt.Errorf("output %q not found", a.cfg.Output)
@@ -296,21 +304,44 @@ func (a *App) onSeat(m wire.Message) {
 	}
 }
 
+func (a *App) monitorBySurface(id uint32) *monitor {
+	for _, m := range a.monitors {
+		if m.surface == id {
+			return m
+		}
+	}
+	return nil
+}
+
 func (a *App) onPointer(m wire.Message) {
 	ar := wire.NewArgs(m.Args)
 	switch m.Opcode {
 	case 0: // enter
-		serial := ar.U32()
-		ar.U32()
-		a.px, a.py = ar.Fixed(), ar.Fixed()
-		a.havePtr = true
-		a.pending = true
+		serial, surf := ar.U32(), ar.U32()
+		mon := a.monitorBySurface(surf)
+		if mon == nil {
+			return
+		}
+		a.active = mon
+		mon.px, mon.py = ar.Fixed(), ar.Fixed()
+		mon.hasPtr = true
+		mon.pending = true
 		a.conn.Req(a.pointer, 0).U32(serial).U32(0).I32(0).I32(0).Send() // hide cursor
+	case 1: // leave
+		ar.U32()
+		if mon := a.monitorBySurface(ar.U32()); mon != nil {
+			mon.hasPtr = false
+			mon.pending = true
+			if a.active == mon {
+				a.active = nil
+			}
+		}
 	case 2: // motion
 		ar.U32()
-		a.px, a.py = ar.Fixed(), ar.Fixed()
-		a.havePtr = true
-		a.pending = true
+		if a.active != nil {
+			a.active.px, a.active.py = ar.Fixed(), ar.Fixed()
+			a.active.pending = true
+		}
 	case 3: // button
 		ar.U32()
 		ar.U32()
@@ -322,9 +353,15 @@ func (a *App) onPointer(m wire.Message) {
 		ar.U32()
 		axis, v := ar.U32(), ar.Fixed()
 		if axis == 0 && v != 0 {
-			a.zoom = math.Min(math.Max(a.zoom*math.Pow(1.1, -v/10), a.cfg.MinZoom), a.cfg.MaxZoom)
-			a.pending = true
+			a.setZoom(a.zoom * math.Pow(1.1, -v/10))
 		}
+	}
+}
+
+func (a *App) setZoom(z float64) {
+	a.zoom = math.Min(math.Max(z, a.cfg.MinZoom), a.cfg.MaxZoom)
+	if a.active != nil {
+		a.active.pending = true
 	}
 }
 
@@ -341,78 +378,90 @@ func (a *App) onKeyboard(m wire.Message) {
 		case 1, 16: // Escape, q
 			a.quit = true
 		case 13, 78: // = / keypad +
-			a.zoom = math.Min(a.zoom*1.1, a.cfg.MaxZoom)
-			a.pending = true
+			a.setZoom(a.zoom * 1.1)
 		case 12, 74: // - / keypad -
-			a.zoom = math.Max(a.zoom/1.1, a.cfg.MinZoom)
-			a.pending = true
+			a.setZoom(a.zoom / 1.1)
 		}
 	}
 }
 
-func (a *App) createSurface(out *output) error {
-	a.surface = a.conn.NewID()
-	a.conn.Req(a.compositor, 0).U32(a.surface).Send()
-	a.layer = a.conn.NewID()
-	a.conn.Req(a.layerShell, 0).U32(a.layer).U32(a.surface).U32(out.id).U32(3).Str("gomag").Send()
-	a.conn.Req(a.layer, 0).U32(0).U32(0).Send() // set_size 0,0 = fill
-	a.conn.Req(a.layer, 1).U32(15).Send()       // anchor all edges
-	a.conn.Req(a.layer, 2).I32(-1).Send()       // exclusive zone -1: ignore other surfaces
-	a.conn.Req(a.layer, 4).U32(1).Send()        // exclusive keyboard
-	a.handlers[a.layer] = func(m wire.Message) {
-		ar := wire.NewArgs(m.Args)
-		switch m.Opcode {
+func (a *App) createSurface(m *monitor) {
+	m.surface = a.conn.NewID()
+	a.conn.Req(a.compositor, 0).U32(m.surface).Send()
+	m.layer = a.conn.NewID()
+	a.conn.Req(a.layerShell, 0).U32(m.layer).U32(m.surface).U32(m.out.id).U32(3).Str("gomag").Send()
+	a.conn.Req(m.layer, 0).U32(0).U32(0).Send() // set_size 0,0 = fill
+	a.conn.Req(m.layer, 1).U32(15).Send()       // anchor all edges
+	a.conn.Req(m.layer, 2).I32(-1).Send()       // exclusive zone -1: ignore other surfaces
+	a.conn.Req(m.layer, 4).U32(1).Send()        // exclusive keyboard
+	a.handlers[m.layer] = func(ev wire.Message) {
+		ar := wire.NewArgs(ev.Args)
+		switch ev.Opcode {
 		case 0:
 			serial, w, h := ar.U32(), int(ar.U32()), int(ar.U32())
-			a.conn.Req(a.layer, 6).U32(serial).Send()
-			a.lw, a.lh = w, h
-			a.scale = int(math.Round(float64(a.src.W) / float64(w)))
-			if a.scale < 1 {
-				a.scale = 1
+			a.conn.Req(m.layer, 6).U32(serial).Send()
+			m.lw, m.lh = w, h
+			m.scale = int(math.Round(float64(m.src.W) / float64(w)))
+			if m.scale < 1 {
+				m.scale = 1
 			}
-			if a.scale > 1 {
-				a.conn.Req(a.surface, 8).I32(int32(a.scale)).Send()
+			if m.scale > 1 {
+				a.conn.Req(m.surface, 8).I32(int32(m.scale)).Send()
 			}
-			a.configured = true
-			a.pending = true
+			m.configured = true
+			m.pending = true
 		case 1:
 			a.quit = true
 		}
 	}
-	a.conn.Req(a.surface, 6).Send() // commit to get configure
-	return nil
+	a.conn.Req(m.surface, 6).Send() // commit to get configure
 }
 
 // acquire returns an idle buffer matching the source size.
-func (a *App) acquire() (*shmBuffer, error) {
-	for _, b := range a.bufs {
-		if !b.busy && b.w == a.src.W && b.h == a.src.H {
+func (a *App) acquire(m *monitor) (*shmBuffer, error) {
+	for _, b := range m.bufs {
+		if !b.busy {
 			return b, nil
 		}
 	}
-	if len(a.bufs) >= 4 {
+	if len(m.bufs) >= 4 {
 		return nil, nil
 	}
-	b, err := a.newShmBuffer(a.src.W, a.src.H, a.src.W*4, fmtARGB8888)
+	b, err := a.newShmBuffer(m.src.W, m.src.H, m.src.W*4, fmtARGB8888)
 	if err != nil {
 		return nil, err
 	}
-	a.bufs = append(a.bufs, b)
+	m.bufs = append(m.bufs, b)
 	return b, nil
 }
 
-func (a *App) present(b *shmBuffer) {
+func (a *App) present(m *monitor, b *shmBuffer) {
 	b.busy = true
-	a.conn.Req(a.surface, 1).U32(b.id).I32(0).I32(0).Send()
-	a.conn.Req(a.surface, 9).I32(0).I32(0).I32(math.MaxInt32).I32(math.MaxInt32).Send()
-	a.conn.Req(a.surface, 6).Send()
+	a.conn.Req(m.surface, 1).U32(b.id).I32(0).I32(0).Send()
+	a.conn.Req(m.surface, 9).I32(0).I32(0).I32(math.MaxInt32).I32(math.MaxInt32).Send()
+	a.conn.Req(m.surface, 6).Send()
 }
 
-func (a *App) redraw() {
-	if !a.configured || !a.pending || a.quit || a.capture || a.hidden {
+// lens returns the lens geometry in buffer pixels and whether a lens is shown.
+func (a *App) lens(m *monitor) (render.Lens, bool) {
+	sc := float64(m.scale)
+	l := render.Lens{Radius: a.cfg.Radius * sc, Zoom: a.zoom}
+	switch {
+	case m.hasPtr:
+		l.X, l.Y = m.px*sc, m.py*sc
+	case a.active == nil && m == a.monitors[0]:
+		l.X, l.Y = float64(m.src.W)/2, float64(m.src.H)/2
+	default:
+		return l, false
+	}
+	return l, true
+}
+
+func (a *App) redraw(m *monitor) {
+	if !m.configured || !m.pending || a.quit || m.capturing {
 		return
 	}
-	b, err := a.acquire()
+	b, err := a.acquire(m)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gomag:", err)
 		a.quit = true
@@ -421,54 +470,65 @@ func (a *App) redraw() {
 	if b == nil {
 		return // all buffers busy; retry on next event
 	}
-	a.pending = false
-	cx, cy := float64(a.src.W)/2, float64(a.src.H)/2
-	if a.havePtr {
-		cx, cy = a.px*float64(a.scale), a.py*float64(a.scale)
-	}
+	m.pending = false
 	dst := &render.Image{W: b.w, H: b.h, Stride: b.stride, Pix: b.data}
-	a.renderer.Draw(dst, render.Lens{X: cx, Y: cy, Radius: a.cfg.Radius * float64(a.scale), Zoom: a.zoom})
-	a.present(b)
+	if l, ok := a.lens(m); ok {
+		m.renderer.Draw(dst, l)
+	} else {
+		m.renderer.DrawHole(dst, render.Lens{X: -1e6, Y: -1e6}) // background only
+	}
+	a.present(m, b)
 }
 
-// startLiveCapture makes the overlay transparent, grabs a fresh frame, then
-// restores the overlay. The overlay must be invisible while capturing,
-// otherwise the screencopy would contain the magnifier itself.
-func (a *App) startLiveCapture(out *output) {
-	if !a.configured || a.capture || a.hidden || a.quit {
+// startLiveCapture refreshes the pixels under the lens. The overlay would
+// otherwise capture itself, so only the lens area is made transparent (the
+// dimmed background stays up), and only the small region that the lens
+// magnifies is captured, which keeps the lens hidden for as short as possible.
+func (a *App) startLiveCapture(m *monitor) {
+	if !m.configured || m.capturing || a.quit || !m.hasPtr {
 		return
 	}
-	b, err := a.acquire()
+	l, _ := a.lens(m)
+	b, err := a.acquire(m)
 	if err != nil || b == nil {
 		return
 	}
-	for i := range b.data {
-		b.data[i] = 0
+	sc := float64(m.scale)
+	r := l.Radius/l.Zoom + 2*sc
+	x0 := int(math.Max(0, math.Floor((l.X-r)/sc)))
+	y0 := int(math.Max(0, math.Floor((l.Y-r)/sc)))
+	x1 := int(math.Min(float64(m.lw), math.Ceil((l.X+r)/sc)))
+	y1 := int(math.Min(float64(m.lh), math.Ceil((l.Y+r)/sc)))
+	if x1-x0 < 1 || y1-y0 < 1 {
+		return
 	}
-	a.present(b)
-	a.hidden = true
-	a.capture = true
-	a.requestCapture(out, func(img *render.Image, err error) {
-		a.capture = false
-		a.hidden = false
-		a.pending = true
+	dst := &render.Image{W: b.w, H: b.h, Stride: b.stride, Pix: b.data}
+	m.renderer.DrawHole(dst, l)
+	a.present(m, b)
+	m.capturing = true
+	a.requestCapture(m, &[4]int{x0, y0, x1 - x0, y1 - y0}, func(img *render.Image, err error) {
+		m.capturing = false
+		m.pending = true
 		if err != nil {
 			a.logf("live capture failed: %v", err)
 			return
 		}
-		if img.W == a.src.W && img.H == a.src.H {
-			a.src = img
-			a.renderer.SetSource(img)
-		}
+		m.renderer.UpdateRegion(img, x0*m.scale, y0*m.scale)
 	})
 }
 
 func closeFd(fd int) { syscallClose(fd) }
 
-// requestCapture starts a screencopy of the output and calls done on completion.
-func (a *App) requestCapture(out *output, done func(*render.Image, error)) {
+// requestCapture starts a screencopy of the monitor's output (or of region
+// {x, y, w, h} in logical coordinates) and calls done on completion.
+func (a *App) requestCapture(m *monitor, region *[4]int, done func(*render.Image, error)) {
 	frame := a.conn.NewID()
-	a.conn.Req(a.screencopy, 0).U32(frame).I32(0).U32(out.id).Send()
+	if region == nil {
+		a.conn.Req(a.screencopy, 0).U32(frame).I32(0).U32(m.out.id).Send()
+	} else {
+		a.conn.Req(a.screencopy, 1).U32(frame).I32(0).U32(m.out.id).
+			I32(int32(region[0])).I32(int32(region[1])).I32(int32(region[2])).I32(int32(region[3])).Send()
+	}
 	var (
 		format       uint32
 		w, h, stride int
@@ -497,9 +557,9 @@ func (a *App) requestCapture(out *output, done func(*render.Image, error)) {
 			a.conn.Req(frame, 0).U32(buf.id).Send()
 		}
 	)
-	a.handlers[frame] = func(m wire.Message) {
-		ar := wire.NewArgs(m.Args)
-		switch m.Opcode {
+	a.handlers[frame] = func(ev wire.Message) {
+		ar := wire.NewArgs(ev.Args)
+		switch ev.Opcode {
 		case 0: // buffer
 			format, w, h, stride = ar.U32(), int(ar.U32()), int(ar.U32()), int(ar.U32())
 			if a.screencopyVersion < 3 {
@@ -518,11 +578,11 @@ func (a *App) requestCapture(out *output, done func(*render.Image, error)) {
 	}
 }
 
-func (a *App) captureSync(out *output, stop <-chan struct{}) error {
+func (a *App) captureSync(m *monitor, stop <-chan struct{}) error {
 	var img *render.Image
 	var cerr error
 	err := a.waitFor(stop, func(done func()) uint32 {
-		a.requestCapture(out, func(i *render.Image, e error) { img, cerr = i, e; done() })
+		a.requestCapture(m, nil, func(i *render.Image, e error) { img, cerr = i, e; done() })
 		return 0
 	})
 	if err != nil {
@@ -531,6 +591,6 @@ func (a *App) captureSync(out *output, stop <-chan struct{}) error {
 	if cerr != nil {
 		return cerr
 	}
-	a.src = img
+	m.src = img
 	return nil
 }

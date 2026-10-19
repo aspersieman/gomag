@@ -11,13 +11,19 @@ gomag speaks the wlroots protocols `wlr-layer-shell` and `wlr-screencopy`, so it
 Hyprland, MangoWM, sway, river, labwc, Wayfire and other compositors that implement them.
 GNOME/Mutter and KDE/KWin do not implement these protocols.
 
-## Build
+## Build, run, install
 
-    go build -o gomag ./cmd/gomag
+    make dev        # build and run (ARGS defaults to "-live -verbose")
+    make dev ARGS="-radius 150 -blur"
+    make build      # ./bin/gomag
+    make install    # to ~/.local/bin; use PREFIX=/usr/local (with sudo) for system-wide
+    make test
+
+`make help` lists all targets.
 
 ## Usage
 
-    gomag [-radius 200] [-zoom 2] [-dim 0.4] [-blur] [-live] [-fps 10] [-output NAME]
+    gomag [-radius 200] [-zoom 2] [-dim 0.4] [-blur]  [-output NAME]
 
 - Scroll wheel (or `+` / `-`): zoom in / out
 - `Esc`, `q` or right click: quit
@@ -33,12 +39,18 @@ MangoWM (`config.conf`):
 
     bind=SUPER,m,spawn,/path/to/gomag -live
 
+### Multiple monitors
+
+gomag covers every monitor with its own overlay; the lens appears on whichever monitor the
+pointer is on. Use `-output NAME` (e.g. `-output eDP-1`) to limit it to a single monitor.
+
 ### Live vs. frozen
 
-By default gomag captures the screen once at start-up and magnifies that snapshot.
-With `-live` it keeps re-capturing the screen (`-fps`, default 10). Because the lens itself
-is part of the composited output, it is made transparent for a moment around every capture,
-which can cause a brief flicker of the lens; lower `-fps` to reduce it.
+By default gomag magnifies a snapshot taken at start-up. With `-live` it keeps refreshing the
+magnified area (`-fps`, default 10). The overlay would otherwise capture itself, so for each
+refresh only the lens is made transparent for an instant while just the small area under it is
+captured; the dimmed background stays up and is *not* refreshed (it remains the start-up
+snapshot). A faint flicker of the lens can remain on slower machines; lower `-fps` to reduce it.
 
 ## Test
 

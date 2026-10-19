@@ -26,7 +26,7 @@ func main() {
 	flag.Float64Var(&cfg.Border, "border", 2, "lens border width in pixels (0 = none)")
 	flag.BoolVar(&cfg.Live, "live", false, "continuously refresh the magnified content (may flicker briefly on each refresh)")
 	flag.IntVar(&cfg.FPS, "fps", 10, "refresh rate used with -live")
-	flag.StringVar(&cfg.Output, "output", "", "output (monitor) name; default: first output")
+	flag.StringVar(&cfg.Output, "output", "", "limit to one output (monitor) by name; default: all outputs")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "print diagnostics")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: gomag [flags]\n\nRunning gomag while it is already running closes it, so a single key binding toggles it.\nScroll wheel: zoom. Esc, q or right click: quit.\n\n")
