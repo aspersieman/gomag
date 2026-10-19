@@ -47,6 +47,8 @@ type monitor struct {
 	px, py         float64
 	hasPtr         bool
 	capturing      bool
+	capBuf         *shmBuffer // reused screencopy target for live refreshes
+	capFmt         uint32
 }
 
 // App is the magnifier client.
@@ -481,18 +483,15 @@ func (a *App) redraw(m *monitor) {
 }
 
 // startLiveCapture refreshes the pixels under the lens. The overlay would
-// otherwise capture itself, so only the lens area is made transparent (the
-// dimmed background stays up), and only the small region that the lens
-// magnifies is captured, which keeps the lens hidden for as short as possible.
+// otherwise capture itself, so the lens is replaced by a transparent hole,
+// but only for the shortest possible time: the screencopy frame is created
+// first and the capture buffer is reused, so the hole is committed in the same
+// breath as the copy request and removed again as soon as the frame is ready.
 func (a *App) startLiveCapture(m *monitor) {
 	if !m.configured || m.capturing || a.quit || !m.hasPtr {
 		return
 	}
 	l, _ := a.lens(m)
-	b, err := a.acquire(m)
-	if err != nil || b == nil {
-		return
-	}
 	sc := float64(m.scale)
 	r := l.Radius/l.Zoom + 2*sc
 	x0 := int(math.Max(0, math.Floor((l.X-r)/sc)))
@@ -502,11 +501,18 @@ func (a *App) startLiveCapture(m *monitor) {
 	if x1-x0 < 1 || y1-y0 < 1 {
 		return
 	}
-	dst := &render.Image{W: b.w, H: b.h, Stride: b.stride, Pix: b.data}
-	m.renderer.DrawHole(dst, l)
-	a.present(m, b)
 	m.capturing = true
-	a.requestCapture(m, &[4]int{x0, y0, x1 - x0, y1 - y0}, func(img *render.Image, err error) {
+	hole := func() {
+		b, err := a.acquire(m)
+		if err != nil || b == nil {
+			return
+		}
+		cur, _ := a.lens(m) // pointer may have moved since the request
+		dst := &render.Image{W: b.w, H: b.h, Stride: b.stride, Pix: b.data}
+		m.renderer.DrawHole(dst, cur)
+		a.present(m, b)
+	}
+	a.requestCapture(m, &[4]int{x0, y0, x1 - x0, y1 - y0}, true, hole, func(img *render.Image, err error) {
 		m.capturing = false
 		m.pending = true
 		if err != nil {
@@ -521,7 +527,7 @@ func closeFd(fd int) { syscallClose(fd) }
 
 // requestCapture starts a screencopy of the monitor's output (or of region
 // {x, y, w, h} in logical coordinates) and calls done on completion.
-func (a *App) requestCapture(m *monitor, region *[4]int, done func(*render.Image, error)) {
+func (a *App) requestCapture(m *monitor, region *[4]int, reuse bool, beforeCopy func(), done func(*render.Image, error)) {
 	frame := a.conn.NewID()
 	if region == nil {
 		a.conn.Req(a.screencopy, 0).U32(frame).I32(0).U32(m.out.id).Send()
@@ -538,7 +544,7 @@ func (a *App) requestCapture(m *monitor, region *[4]int, done func(*render.Image
 		finish       = func(img *render.Image, err error) {
 			a.conn.Req(frame, 1).Send()
 			delete(a.handlers, frame)
-			if buf != nil {
+			if buf != nil && !reuse {
 				a.destroyShmBuffer(buf)
 			}
 			done(img, err)
@@ -549,10 +555,24 @@ func (a *App) requestCapture(m *monitor, region *[4]int, done func(*render.Image
 			}
 			copied = true
 			var err error
-			buf, err = a.newShmBuffer(w, h, stride, format)
-			if err != nil {
-				finish(nil, err)
-				return
+			if reuse && m.capBuf != nil && m.capBuf.w == w && m.capBuf.h == h && m.capBuf.stride == stride && m.capFmt == format {
+				buf = m.capBuf
+			} else {
+				if reuse && m.capBuf != nil {
+					a.destroyShmBuffer(m.capBuf)
+					m.capBuf = nil
+				}
+				buf, err = a.newShmBuffer(w, h, stride, format)
+				if err != nil {
+					finish(nil, err)
+					return
+				}
+				if reuse {
+					m.capBuf, m.capFmt = buf, format
+				}
+			}
+			if beforeCopy != nil {
+				beforeCopy()
 			}
 			a.conn.Req(frame, 0).U32(buf.id).Send()
 		}
@@ -582,7 +602,7 @@ func (a *App) captureSync(m *monitor, stop <-chan struct{}) error {
 	var img *render.Image
 	var cerr error
 	err := a.waitFor(stop, func(done func()) uint32 {
-		a.requestCapture(m, nil, func(i *render.Image, e error) { img, cerr = i, e; done() })
+		a.requestCapture(m, nil, false, nil, func(i *render.Image, e error) { img, cerr = i, e; done() })
 		return 0
 	})
 	if err != nil {

@@ -25,7 +25,7 @@ func main() {
 	flag.BoolVar(&cfg.Blur, "blur", false, "blur the area outside the lens")
 	flag.Float64Var(&cfg.Border, "border", 2, "lens border width in pixels (0 = none)")
 	flag.BoolVar(&cfg.Live, "live", false, "continuously refresh the magnified content (may flicker briefly on each refresh)")
-	flag.IntVar(&cfg.FPS, "fps", 10, "refresh rate used with -live")
+	flag.IntVar(&cfg.FPS, "fps", 8, "refresh rate used with -live")
 	flag.StringVar(&cfg.Output, "output", "", "limit to one output (monitor) by name; default: all outputs")
 	flag.BoolVar(&cfg.Verbose, "verbose", false, "print diagnostics")
 	flag.Usage = func() {
